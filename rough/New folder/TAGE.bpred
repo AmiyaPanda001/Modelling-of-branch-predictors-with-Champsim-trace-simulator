@@ -1,0 +1,550 @@
+#include "ooo_cpu.h"
+
+#include <string>
+
+const __int128 MASK_10 = 1024 - 1;
+const __int128 MASK_20 = 1024*1024 - 1;
+const __int128 MASK_40 = (MASK_20 + 1)* (MASK_20 + 1) - 1;
+
+//Bimodal parameters
+#define BIMODAL_TABLE_SIZE 16384
+#define BIMODAL_PRIME 16381
+#define MAX_COUNTER 7
+int bimodal_table[NUM_CPUS][BIMODAL_TABLE_SIZE];
+
+//Gshare predictor parameters
+#define GLOBAL_HISTORY_LENGTH 80
+const __int128 GLOBAL_HISTORY_MASK = (1 << GLOBAL_HISTORY_LENGTH) - 1;
+__int128 branch_history_vector[NUM_CPUS];
+
+#define INDEX_LENGTH 10
+#define TAG_LENGTH 8
+#define GS_HISTORY_TABLE_SIZE 1024
+#define GLOBAL_HISTORY_TABLE_PRIME 1023
+int gs_history_table[NUM_CPUS][GS_HISTORY_TABLE_SIZE];
+int my_last_prediction[NUM_CPUS];
+
+//Meta predictor parameters
+int picked_predictor; // 1 - gshare, 0 - bimodal
+int alternate_predictor;
+int current_prediction; // 1-taken, 0-not taken
+int altpred;
+int counter;
+int state_counter;
+
+
+//Entry of TAGE Bank
+struct TagEntry
+{
+    int32_t ctr;
+    uint32_t tag;
+    int32_t usefulBits;
+};
+
+ TagEntry branch_tag_table_10[NUM_CPUS][GS_HISTORY_TABLE_SIZE - 1];
+ TagEntry branch_tag_table_20[NUM_CPUS][GS_HISTORY_TABLE_SIZE - 1];
+ TagEntry branch_tag_table_40[NUM_CPUS][GS_HISTORY_TABLE_SIZE - 1];
+ TagEntry branch_tag_table_80[NUM_CPUS][GS_HISTORY_TABLE_SIZE - 1];
+
+//Concatenate functions-----------------------------------------------------------------------------------------------------
+int concat(int a, int b, int c, int d)
+{
+
+    // Convert both the integers to string
+    string s1 = to_string(a);
+    string s2 = to_string(b);
+	string s3 = to_string(c);
+    string s4 = to_string(d);
+
+    // Concatenate both strings
+    string s = s1 + s2 + s3 + s4;
+
+    // Convert the concatenated string
+    // to integer
+    int o = stoi(s);
+
+    // return the formed integer
+    return o;
+}
+
+//Arbitrator functions----------------------------------------------------------------------------------------------------------
+//Two stage arbitrator
+int arbitrator_two_input(){
+	int a = rand();
+	return a%3;
+}
+//Two stage arbitrator
+int arbitrator_three_input(){
+	int a = rand();
+	return a%7;
+}
+//Two stage arbitrator
+int arbitrator_four_input(){
+	int a = rand();
+	return a%15;
+}
+//Bimodal functions-----------------------------------------------------------------------------------------------------
+
+void bimodal_initialize_branch_predictor(uint32_t cpu)
+{
+    cout << "CPU " << cpu << " Bimodal branch predictor" << endl;
+
+    for(int i = 0; i < BIMODAL_TABLE_SIZE; i++)
+        bimodal_table[cpu][i] = 0;
+}
+
+uint8_t bimodal_predict_branch(uint64_t ip, uint32_t cpu)
+{
+    uint32_t hash = ip % BIMODAL_PRIME;
+    uint8_t prediction = (bimodal_table[cpu][hash] >= ((MAX_COUNTER + 1)/2)) ? 1 : 0;
+
+    return prediction;
+}
+
+void bimodal_last_branch_result(uint64_t ip, uint8_t taken, uint32_t cpu)
+{
+    uint32_t hash = ip % BIMODAL_PRIME;
+
+    if (taken && (bimodal_table[cpu][hash] < MAX_COUNTER))
+        bimodal_table[cpu][hash]++;
+    else if ((taken == 0) && (bimodal_table[cpu][hash] > 0))
+        bimodal_table[cpu][hash]--;
+}
+
+//TAGE functions----------------------------------------------------------------------------------------------------------
+
+
+void tage_initialize_branch_predictor(uint32_t cpu)
+{
+    cout << "CPU " << cpu << " TAGE branch predictor" << endl;
+
+	counter = 0;
+	state_counter = 2;
+    branch_history_vector[cpu] = 0;
+    my_last_prediction[cpu] = 0;
+
+    for(int i=0; i<GS_HISTORY_TABLE_SIZE; i++){
+        branch_tag_table_10[cpu][i].ctr = 2; branch_tag_table_10[cpu][i].tag = 0; branch_tag_table_10[cpu][i].usefulBits = 0;
+
+		branch_tag_table_20[cpu][i].ctr = 2; branch_tag_table_20[cpu][i].tag = 0; branch_tag_table_20[cpu][i].usefulBits = 0;
+
+		branch_tag_table_40[cpu][i].ctr = 2; branch_tag_table_40[cpu][i].tag = 0; branch_tag_table_40[cpu][i].usefulBits = 0;
+
+		branch_tag_table_80[cpu][i].ctr = 2; branch_tag_table_80[cpu][i].tag = 0; branch_tag_table_80[cpu][i].usefulBits = 0;
+	}
+}
+
+unsigned int tage_table_hash_index_10(uint64_t ip, __int128 bh_vector)
+{
+    unsigned int hash = ip^(ip>>INDEX_LENGTH)^(ip>>(INDEX_LENGTH*2))^(ip>>(INDEX_LENGTH*3))^(bh_vector & MASK_10);
+    hash = hash%GS_HISTORY_TABLE_SIZE;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_index_20(uint64_t ip, __int128 bh_vector)
+{
+    unsigned int hash = ip^(ip>>INDEX_LENGTH)^(ip>>(INDEX_LENGTH*2))^(ip>>(INDEX_LENGTH*3))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+    hash = hash%GS_HISTORY_TABLE_SIZE;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_index_40(uint64_t ip, __int128 bh_vector)
+{
+	bh_vector = (bh_vector & MASK_20)^((bh_vector>>2*INDEX_LENGTH)& MASK_20);
+    unsigned int hash = ip^(ip>>INDEX_LENGTH)^(ip>>(INDEX_LENGTH*2))^(ip>>(INDEX_LENGTH*3))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+    hash = hash%GS_HISTORY_TABLE_SIZE;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_index_80(uint64_t ip, __int128 bh_vector)
+{
+	bh_vector = (bh_vector & MASK_40)^((bh_vector>>4*INDEX_LENGTH)& MASK_40);
+	bh_vector = (bh_vector & MASK_20)^((bh_vector>>2*INDEX_LENGTH)& MASK_20);
+  unsigned int hash = ip^(ip>>INDEX_LENGTH)^(ip>>(INDEX_LENGTH*2))^(ip>>(INDEX_LENGTH*3))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+  hash = hash%GS_HISTORY_TABLE_SIZE;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_tag_10(uint64_t ip, __int128 bh_vector)
+{
+    unsigned int hash = ip^(ip>>TAG_LENGTH)^(ip>>(TAG_LENGTH*2))^(ip>>(TAG_LENGTH*3))^(ip>>(TAG_LENGTH*4))^(bh_vector & MASK_10);
+    hash = hash%256;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_tag_20(uint64_t ip, __int128 bh_vector)
+{
+    unsigned int hash = ip^(ip>>TAG_LENGTH)^(ip>>(TAG_LENGTH*2))^(ip>>(TAG_LENGTH*3))^(ip>>(TAG_LENGTH*4))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+    hash = hash%256;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_tag_40(uint64_t ip, __int128 bh_vector)
+{
+	bh_vector = (bh_vector & MASK_20)^((bh_vector>>2*INDEX_LENGTH)& MASK_20);
+    unsigned int hash = ip^(ip>>TAG_LENGTH)^(ip>>(TAG_LENGTH*2))^(ip>>(TAG_LENGTH*3))^(ip>>(TAG_LENGTH*4))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+	hash = hash%256;
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+unsigned int tage_table_hash_tag_80(uint64_t ip, __int128 bh_vector)
+{
+	bh_vector = (bh_vector & MASK_40)^((bh_vector>>4*INDEX_LENGTH)& MASK_40);
+	bh_vector = (bh_vector & MASK_20)^((bh_vector>>2*INDEX_LENGTH)& MASK_20);
+    unsigned int hash = ip^(ip>>TAG_LENGTH)^(ip>>(TAG_LENGTH*2))^(ip>>(TAG_LENGTH*3))^(ip>>(TAG_LENGTH*4))^(bh_vector & MASK_10)^((bh_vector>>INDEX_LENGTH)& MASK_10);
+    hash = hash%256;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+//TAGE Branch predictor---------------------------------------------------------------------------------------------------------------------------------
+
+void O3_CPU::initialize_branch_predictor()
+{
+    cout << "CPU " << cpu << " TAGE branch predictor" << endl;
+
+	bimodal_initialize_branch_predictor(0);
+    tage_initialize_branch_predictor(0);
+
+	current_prediction = 0;
+	picked_predictor = 0;
+}
+
+uint8_t O3_CPU::predict_branch(uint64_t ip)
+{
+	uint8_t prediction;
+
+	uint32_t tage_hash_INDEX_table_10 = tage_table_hash_index_10(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_20 = tage_table_hash_index_20(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_40 = tage_table_hash_index_40(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_80 = tage_table_hash_index_80(ip, branch_history_vector[cpu]);
+
+	uint32_t tage_hash_TAG_table_10 = tage_table_hash_tag_10(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_20 = tage_table_hash_tag_20(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_40 = tage_table_hash_tag_40(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_80 = tage_table_hash_tag_80(ip, branch_history_vector[cpu]);
+
+	/*
+	if (tage_hash_TAG_table_80 == branch_tag_table_80[0][tage_hash_INDEX_table_80].tag)
+	{
+		prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+	}
+	else if (tage_hash_TAG_table_40 == branch_tag_table_40[0][tage_hash_INDEX_table_40].tag)
+	{
+		prediction = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+	}
+	else if (tage_hash_TAG_table_20 == branch_tag_table_20[0][tage_hash_INDEX_table_20].tag)
+	{
+		prediction = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+	}
+	else if (tage_hash_TAG_table_10 == branch_tag_table_10[0][tage_hash_INDEX_table_10].tag)
+	{
+		prediction = branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr >> 2;
+	}
+	else
+	{
+		prediction = bimodal_predict_branch(ip, 0);
+	}*/
+
+	//Provider and altpred
+	uint8_t pred_80 = 0;
+	uint8_t pred_40 = 0;
+	uint8_t pred_20 = 0;
+	uint8_t pred_10 = 0;
+
+	if (tage_hash_TAG_table_80 == branch_tag_table_80[0][tage_hash_INDEX_table_80].tag) pred_80 = 1;
+
+	if (tage_hash_TAG_table_40 == branch_tag_table_40[0][tage_hash_INDEX_table_40].tag) pred_40 = 1;
+
+	if (tage_hash_TAG_table_20 == branch_tag_table_20[0][tage_hash_INDEX_table_20].tag) pred_20 = 1;
+
+	if (tage_hash_TAG_table_10 == branch_tag_table_10[0][tage_hash_INDEX_table_10].tag) pred_10 = 1;
+
+	int condition = concat(pred_80, pred_40, pred_20, pred_10);
+
+	switch(condition) {
+		case 1111: picked_predictor = 80;
+				   alternate_predictor = 40;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   break;
+		case 1110: picked_predictor = 80;
+				   alternate_predictor = 40;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   break;
+		case 1101: picked_predictor = 80;
+				   alternate_predictor = 40;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   break;
+		case 1100: picked_predictor = 80;
+				   alternate_predictor = 40;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   break;
+		case 1011: picked_predictor = 80;
+				   alternate_predictor = 20;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   break;
+		case 1010: picked_predictor = 80;
+				   alternate_predictor = 20;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   break;
+		case 1001: picked_predictor = 80;
+				   alternate_predictor = 10;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr >> 2;
+				   break;
+		case 1000: picked_predictor = 80;
+				   alternate_predictor = 0;
+				   prediction = branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr >> 2;
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+		case 0111: picked_predictor = 40;
+				   alternate_predictor = 20;
+				   prediction = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   altpred  = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   break;
+		case 0110: picked_predictor = 40;
+				   alternate_predictor = 20;
+				   prediction = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   altpred  = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   break;
+		case 0101: picked_predictor = 40;
+				   alternate_predictor = 10;
+				   prediction = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   altpred  = branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr >> 2;
+				   break;
+		case 0100: picked_predictor = 40;
+				   alternate_predictor = 0;
+				   prediction = branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr >> 2;
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+		case 0011: picked_predictor = 20;
+				   alternate_predictor = 10;
+				   prediction = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   altpred  = branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr >> 2;
+				   break;
+		case 0010: picked_predictor = 20;
+				   alternate_predictor = 0;
+				   prediction = branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr >> 2;
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+		case 0001: picked_predictor = 10;
+				   alternate_predictor = 0;
+				   prediction = branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr >> 2;
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+		case 0000: picked_predictor = 0;
+				   alternate_predictor = 0;
+				   prediction = bimodal_predict_branch(ip, 0);
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+		default	 : picked_predictor = 0;
+				   alternate_predictor = 0;
+				   prediction = bimodal_predict_branch(ip, 0);
+				   altpred  = bimodal_predict_branch(ip, 0);
+				   break;
+	}
+
+	current_prediction = prediction;
+    return prediction;
+}
+
+void O3_CPU::last_branch_result(uint64_t ip, uint8_t taken)
+{
+	counter++; //increment counter
+
+	//hash calculation for index ang tag
+	uint32_t tage_hash_INDEX_table_10 = tage_table_hash_index_10(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_20 = tage_table_hash_index_20(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_40 = tage_table_hash_index_40(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_INDEX_table_80 = tage_table_hash_index_80(ip, branch_history_vector[cpu]);
+
+	uint32_t tage_hash_TAG_table_10 = tage_table_hash_tag_10(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_20 = tage_table_hash_tag_20(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_40 = tage_table_hash_tag_40(ip, branch_history_vector[cpu]);
+	uint32_t tage_hash_TAG_table_80 = tage_table_hash_tag_80(ip, branch_history_vector[cpu]);
+
+	//update useful bits logic --------logic for bimodal ???
+	if (picked_predictor == 80){
+
+		if(altpred != current_prediction){
+				if (current_prediction == taken)
+					{ if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits < 3)
+							branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits++;}
+				else
+					{ if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits > 0)
+							branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits--;}
+		}
+	}
+
+	if (picked_predictor == 40){
+
+		if(altpred != current_prediction){
+				if (current_prediction == taken)
+					{ if (branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits < 3)
+							branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits++;}
+				else
+					{ if (branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits > 0)
+							branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits--;}
+		}
+	}
+
+	if (picked_predictor == 20){
+
+		if(altpred != current_prediction){
+				if (current_prediction == taken)
+					{ if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits < 3)
+							branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits++;}
+				else
+					{ if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits > 0)
+							branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits--;}
+		}
+	}
+
+	if (picked_predictor == 10){
+
+		if(altpred != current_prediction){
+				if (current_prediction == taken)
+					{ if (branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits < 3)
+							branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits++;}
+				else
+					{ if (branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits > 0)
+							branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits--;}
+		}
+	}
+
+
+	//periodic update of uuseful bits logic
+	if(counter == 256000){
+		counter = 0;
+		branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits = branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits & state_counter;
+		branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits = branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits & state_counter;
+		branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits = branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits & state_counter;
+		branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits = branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits & state_counter;
+
+		if(state_counter == 2) state_counter = 1;
+		else state_counter = 2;
+	}
+
+	//update prediction bit
+	if (current_prediction == taken){
+
+		if (picked_predictor == 80)
+			{ if (branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr < 7)
+			branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr++;}
+
+		if (picked_predictor == 40)
+			{ if (branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr < 7)
+			branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr++;}
+
+		if (picked_predictor == 20)
+			{ if (branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr < 7)
+			branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr++;}
+
+		if (picked_predictor == 10)
+			{ if (branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr < 7)
+			branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr++;}
+
+		if (picked_predictor == 0)
+			{ bimodal_last_branch_result(ip, taken, 0);}
+	}
+	else {
+
+		if (picked_predictor == 80)
+			{ if (branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr > 0)
+			branch_tag_table_80[0][tage_hash_INDEX_table_80].ctr--;}
+
+		if (picked_predictor == 40)
+			{ if (branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr > 0)
+			branch_tag_table_40[0][tage_hash_INDEX_table_40].ctr--;
+
+			if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits == 0) //allocating entry if usefulBits = 0
+				branch_tag_table_80[0][tage_hash_INDEX_table_80].tag = tage_hash_TAG_table_80;}
+
+		if (picked_predictor == 20)
+			{ if (branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr > 0) //logic needed to be added
+			branch_tag_table_20[0][tage_hash_INDEX_table_20].ctr--;
+
+			if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits == 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits != 0) //allocating entry if usefulBits = 0
+				branch_tag_table_80[0][tage_hash_INDEX_table_80].tag = tage_hash_TAG_table_80;
+
+			else if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits != 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits == 0) //allocating entry if usefulBits = 0
+				branch_tag_table_40[0][tage_hash_INDEX_table_40].tag = tage_hash_TAG_table_40;
+
+			else if (branch_tag_table_80[0][tage_hash_INDEX_table_80].usefulBits == 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits == 0) //allocating entry if usefulBits = 0
+				{int arb = arbitrator_two_input();
+				 if (arb == 0 || arb == 2) branch_tag_table_40[0][tage_hash_INDEX_table_40].tag = tage_hash_TAG_table_40;
+				 else branch_tag_table_80[0][tage_hash_INDEX_table_80].tag = tage_hash_TAG_table_80;
+				}
+
+			}
+
+		if (picked_predictor == 10)
+			{ if (branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr > 0) //logic needed to be added
+			branch_tag_table_10[0][tage_hash_INDEX_table_10].ctr--;
+
+			if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits == 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits != 0) //allocating entry if usefulBits = 0
+				branch_tag_table_20[0][tage_hash_INDEX_table_20].tag = tage_hash_TAG_table_20;
+
+			else if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits != 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits == 0) //allocating entry if usefulBits = 0
+				branch_tag_table_40[0][tage_hash_INDEX_table_40].tag = tage_hash_TAG_table_40;
+
+			else if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits == 0 && branch_tag_table_40[0][tage_hash_INDEX_table_40].usefulBits == 0) //allocating entry if usefulBits = 0
+				{int arb = arbitrator_two_input();
+				 if (arb == 0 || arb == 2) branch_tag_table_20[0][tage_hash_INDEX_table_20].tag = tage_hash_TAG_table_20;
+				 else branch_tag_table_40[0][tage_hash_INDEX_table_40].tag = tage_hash_TAG_table_40;
+
+				}
+			}
+		if (picked_predictor == 0)
+			{ bimodal_last_branch_result(ip, taken, 0);
+
+
+			if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits == 0 && branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits != 0) //allocating entry if usefulBits = 0
+				branch_tag_table_20[0][tage_hash_INDEX_table_20].tag = tage_hash_TAG_table_20;
+
+			else if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits != 0 && branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits == 0) //allocating entry if usefulBits = 0
+				branch_tag_table_10[0][tage_hash_INDEX_table_10].tag = tage_hash_TAG_table_10;
+
+			else if (branch_tag_table_20[0][tage_hash_INDEX_table_20].usefulBits == 0 && branch_tag_table_10[0][tage_hash_INDEX_table_10].usefulBits == 0) //allocating entry if usefulBits = 0
+				{int arb = arbitrator_two_input();
+				 if (arb == 0 || arb == 2) branch_tag_table_10[0][tage_hash_INDEX_table_10].tag = tage_hash_TAG_table_10;
+				 else branch_tag_table_20[0][tage_hash_INDEX_table_20].tag = tage_hash_TAG_table_20;
+
+				}
+			}
+		}
+		
+		
+    // update branch history vector
+    branch_history_vector[cpu] <<= 1;
+    branch_history_vector[cpu] &= GLOBAL_HISTORY_MASK;
+    branch_history_vector[cpu] |= taken;
+}

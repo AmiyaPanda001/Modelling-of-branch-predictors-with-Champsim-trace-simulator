@@ -1,0 +1,164 @@
+#include "ooo_cpu.h"
+
+//Bimodal parameters
+#define BIMODAL_TABLE_SIZE 16384
+#define BIMODAL_PRIME 16381
+#define MAX_COUNTER 3
+int bimodal_table[NUM_CPUS][BIMODAL_TABLE_SIZE];
+
+
+//Pshare predictor parameters
+#define GLOBAL_HISTORY_LENGTH 14
+#define GLOBAL_HISTORY_MASK (1 << GLOBAL_HISTORY_LENGTH) - 1
+int branch_history_vector[NUM_CPUS];
+
+#define GS_HISTORY_TABLE_SIZE 16384
+#define GLOBAL_HISTORY_TABLE_PRIME 16381
+int gs_history_table[NUM_CPUS][GS_HISTORY_TABLE_SIZE];
+int my_last_prediction[NUM_CPUS];
+
+//Meta predictor parameters
+int branch_tag_table[NUM_CPUS][GS_HISTORY_TABLE_SIZE - 1];
+int picked_predictor; // 1 - gshare, 0 - bimodal
+int current_prediction; // 1-taken, 0-not taken
+
+//Bimodal functions-----------------------------------------------------------------------------------------------------
+
+void bimodal_initialize_branch_predictor(uint32_t cpu)
+{
+    cout << "CPU " << cpu << " Bimodal branch predictor" << endl;
+
+    for(int i = 0; i < BIMODAL_TABLE_SIZE; i++)
+        bimodal_table[cpu][i] = 0;
+}
+
+uint8_t bimodal_predict_branch(uint64_t ip, uint32_t cpu)
+{
+    uint32_t hash = ip % BIMODAL_PRIME;
+    uint8_t prediction = (bimodal_table[cpu][hash] >= ((MAX_COUNTER + 1)/2)) ? 1 : 0;
+
+    return prediction;
+}
+
+void bimodal_last_branch_result(uint64_t ip, uint8_t taken, uint32_t cpu)
+{
+    uint32_t hash = ip % BIMODAL_PRIME;
+
+    if (taken && (bimodal_table[cpu][hash] < MAX_COUNTER))
+        bimodal_table[cpu][hash]++;
+    else if ((taken == 0) && (bimodal_table[cpu][hash] > 0))
+        bimodal_table[cpu][hash]--;
+}
+
+//Pshare functions----------------------------------------------------------------------------------------------------------
+
+void gshare_initialize_branch_predictor(uint32_t cpu)
+{
+    cout << "CPU " << cpu << " GSHARE branch predictor" << endl;
+
+    branch_history_vector[cpu] = 0;
+    my_last_prediction[cpu] = 0;
+
+    for(int i=0; i<GS_HISTORY_TABLE_SIZE; i++)
+        gs_history_table[cpu][i] = 2; // 2 is slightly taken
+}
+
+unsigned int gs_table_hash(uint64_t ip, int bh_vector)
+{
+    unsigned int hash = ip^(ip>>GLOBAL_HISTORY_LENGTH)^(ip>>(GLOBAL_HISTORY_LENGTH*2))^bh_vector;
+    hash = hash%GS_HISTORY_TABLE_SIZE;
+
+    //printf("%d\n", hash);
+
+    return hash;
+}
+
+uint8_t gshare_predict_branch(uint64_t ip, uint32_t cpu)
+{
+    int prediction = 1;
+
+    int gs_hash = gs_table_hash(ip, branch_history_vector[cpu]);
+
+    if(gs_history_table[cpu][gs_hash] >= 2)
+        prediction = 1;
+    else
+        prediction = 0;
+
+    my_last_prediction[cpu] = prediction;
+
+    return prediction;
+}
+
+void gshare_last_branch_result(uint64_t ip, uint8_t taken, uint32_t cpu)
+{
+    int gs_hash = gs_table_hash(ip, branch_history_vector[cpu]);
+
+    if(taken == 1) {
+        if(gs_history_table[cpu][gs_hash] < 3)
+            gs_history_table[cpu][gs_hash]++;
+    } else {
+        if(gs_history_table[cpu][gs_hash] > 0)
+            gs_history_table[cpu][gs_hash]--;
+    }
+
+    // update branch history vector
+    branch_history_vector[cpu] <<= 1;
+    branch_history_vector[cpu] &= GLOBAL_HISTORY_MASK;
+    branch_history_vector[cpu] |= taken;
+}
+
+
+//Meta predictor functions--------------------------------------------------------------------------------------------------------------
+
+void O3_CPU::initialize_branch_predictor()
+{
+    cout << "CPU " << cpu << " Bimodal Gshare Hybrid branch predictor" << endl;
+
+	bimodal_initialize_branch_predictor(0);
+    gshare_initialize_branch_predictor(0);
+
+	current_prediction = 0;
+	picked_predictor = 0;
+}
+
+uint8_t tag_matching(uint64_t ip)
+{
+	uint64_t hash = ip % GS_HISTORY_TABLE_SIZE;
+	uint64_t tag = hash % 8;
+	if (tag == branch_tag_table[0][hash]) return 1; // tag found
+	else return 0;
+}
+
+uint8_t O3_CPU::predict_branch(uint64_t ip)
+{
+	uint8_t prediction_bimodal, prediction;
+
+	uint64_t tag = tag_matching(ip);
+
+	prediction_bimodal = bimodal_predict_branch(ip, 0);
+	uint64_t prediction_gshare = gshare_predict_branch(ip, 0);
+
+	if (tag){
+		prediction = prediction_gshare;
+		picked_predictor = 1;
+		current_prediction = prediction;
+	}
+	else {
+		prediction = prediction_bimodal;
+		picked_predictor = 0;
+		current_prediction = prediction;
+	}
+    return prediction;
+}
+
+void O3_CPU::last_branch_result(uint64_t ip, uint8_t taken)
+{
+	bimodal_last_branch_result(ip, taken, 0);
+
+	if (picked_predictor == 1)
+	{
+	gshare_last_branch_result(ip, taken, 0);
+	uint64_t hash = ip % GS_HISTORY_TABLE_SIZE;
+  branch_tag_table[0][hash] = hash % 8;
+	}
+}
